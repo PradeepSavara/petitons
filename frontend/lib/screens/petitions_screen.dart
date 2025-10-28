@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:provider/provider.dart';
 import 'package:Dharma/providers/auth_provider.dart';
 import 'package:Dharma/providers/petition_provider.dart';
 import 'package:Dharma/providers/case_provider.dart';
 import 'package:Dharma/models/petition.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:go_router/go_router.dart';
+// import 'package:go_router/go_router.dart';
+import 'package:Dharma/services/local_storage_service.dart';
 
 class PetitionsScreen extends StatefulWidget {
   const PetitionsScreen({super.key});
@@ -407,6 +409,7 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
   String? _selectedCaseId;
   String? _firNumber;
   bool _isSubmitting = false;
+  List<PlatformFile> _pickedFiles = [];
 
   @override
   void dispose() {
@@ -453,6 +456,24 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
       updatedAt: Timestamp.now(),
     );
 
+    // Save locally selected documents before creating petition
+    try {
+      if (_pickedFiles.isNotEmpty) {
+        final String folderName = _titleController.text.isNotEmpty
+            ? _titleController.text
+            : 'petition_${DateTime.now().millisecondsSinceEpoch}';
+        await LocalStorageService.savePickedFiles(
+          files: _pickedFiles,
+          subfolderName: folderName,
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to save documents locally: $e')),
+      );
+    }
+
+    // Create petition (does not store upload details in Firestore)
     final success = await petitionProvider.createPetition(petition);
 
     setState(() => _isSubmitting = false);
@@ -473,6 +494,9 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
         _caseNumberController.clear();
         _groundsController.clear();
         _prayerReliefController.clear();
+        setState(() {
+          _pickedFiles = [];
+        });
         await petitionProvider.fetchPetitions(authProvider.user!.uid);
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -697,6 +721,75 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                         border: OutlineInputBorder(),
                       ),
                     ),
+                    const SizedBox(height: 16),
+                    Text(
+                      'Supporting Documents (stored locally only)',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        ElevatedButton.icon(
+                          icon: const Icon(Icons.upload_file),
+                          label: const Text('Upload Documents'),
+                          onPressed: _isSubmitting
+                              ? null
+                              : () async {
+                                  final FilePickerResult? result = await FilePicker.platform.pickFiles(
+                                    allowMultiple: true,
+                                    withData: true,
+                                  );
+                                  if (result != null && result.files.isNotEmpty) {
+                                    setState(() {
+                                      _pickedFiles = result.files;
+                                    });
+                                  }
+                                },
+                        ),
+                        const SizedBox(width: 12),
+                        if (_pickedFiles.isNotEmpty)
+                          Text('${_pickedFiles.length} file(s) selected'),
+                      ],
+                    ),
+                    if (_pickedFiles.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(color: Colors.grey.shade300),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: ListView.separated(
+                          physics: const NeverScrollableScrollPhysics(),
+                          shrinkWrap: true,
+                          itemCount: _pickedFiles.length,
+                          separatorBuilder: (_, __) => const Divider(height: 1),
+                          itemBuilder: (context, index) {
+                            final PlatformFile f = _pickedFiles[index];
+                            return ListTile(
+                              dense: true,
+                              leading: const Icon(Icons.insert_drive_file),
+                              title: Text(
+                                f.name,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              subtitle: Text('${(f.size / 1024).toStringAsFixed(1)} KB'),
+                              trailing: IconButton(
+                                icon: const Icon(Icons.close),
+                                onPressed: _isSubmitting
+                                    ? null
+                                    : () {
+                                        setState(() {
+                                          _pickedFiles.removeAt(index);
+                                        });
+                                      },
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
