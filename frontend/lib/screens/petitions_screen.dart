@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:dio/dio.dart';
 import 'package:provider/provider.dart';
 import 'package:Dharma/providers/auth_provider.dart';
 import 'package:Dharma/providers/petition_provider.dart';
@@ -411,6 +412,11 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
   bool _isSubmitting = false;
   List<PlatformFile> _pickedFiles = [];
 
+  bool _isExtracting = false;
+  Map<String, dynamic>? _ocrResult;
+  final Dio _dio = Dio();
+  String _ocrEndpoint = 'http://localhost:8000/api/ocr/extract';
+
   @override
   void dispose() {
     _titleController.dispose();
@@ -421,6 +427,32 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
     _groundsController.dispose();
     _prayerReliefController.dispose();
     super.dispose();
+  }
+
+  Widget _buildOcrSummaryCard(ThemeData theme) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Extracted Text', style: theme.textTheme.labelLarge),
+            const SizedBox(height: 4),
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey.shade300),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                (_ocrResult?['text'] as String?) ?? '',
+                style: theme.textTheme.bodySmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _submitPetition() async {
@@ -506,6 +538,55 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
           ),
         );
       }
+    }
+  }
+
+  Future<void> _runOcrOnFile(PlatformFile file) async {
+    if (_isExtracting) return;
+    setState(() { _isExtracting = true; });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Extracting text from document...')),
+    );
+
+    try {
+      MultipartFile mFile;
+      if (file.bytes != null) {
+        mFile = MultipartFile.fromBytes(
+          file.bytes!,
+          filename: file.name,
+        );
+      } else if (file.path != null) {
+        mFile = await MultipartFile.fromFile(
+          file.path!,
+          filename: file.name,
+        );
+      } else {
+        throw Exception('File content unavailable');
+      }
+
+      final formData = FormData.fromMap({ 'file': mFile });
+      final response = await _dio.post(
+        _ocrEndpoint,
+        data: formData,
+        options: Options(
+          contentType: 'multipart/form-data',
+          receiveTimeout: const Duration(seconds: 60),
+          sendTimeout: const Duration(seconds: 60),
+        ),
+      );
+
+      setState(() { _ocrResult = Map<String, dynamic>.from(response.data); });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Text generated successfully.')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('OCR failed: $e')),
+      );
+    } finally {
+      if (mounted) setState(() { _isExtracting = false; });
     }
   }
 
@@ -729,7 +810,10 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                       ),
                     ),
                     const SizedBox(height: 8),
-                    Row(
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         ElevatedButton.icon(
                           icon: const Icon(Icons.upload_file),
@@ -745,12 +829,22 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                                     setState(() {
                                       _pickedFiles = result.files;
                                     });
+                                    // Trigger OCR immediately on the first selected file
+                                    await _runOcrOnFile(result.files.first);
                                   }
                                 },
                         ),
-                        const SizedBox(width: 12),
                         if (_pickedFiles.isNotEmpty)
-                          Text('${_pickedFiles.length} file(s) selected'),
+                          Text(
+                            '${_pickedFiles.length} file(s) selected',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        if (_isExtracting)
+                          const SizedBox(
+                            height: 16,
+                            width: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
                       ],
                     ),
                     if (_pickedFiles.isNotEmpty) ...[
@@ -769,6 +863,7 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                             final PlatformFile f = _pickedFiles[index];
                             return ListTile(
                               dense: true,
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 8),
                               leading: const Icon(Icons.insert_drive_file),
                               title: Text(
                                 f.name,
@@ -776,6 +871,8 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                               ),
                               subtitle: Text('${(f.size / 1024).toStringAsFixed(1)} KB'),
                               trailing: IconButton(
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
                                 icon: const Icon(Icons.close),
                                 onPressed: _isSubmitting
                                     ? null
@@ -789,6 +886,17 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                           },
                         ),
                       ),
+                    ],
+                    if (_ocrResult != null) ...[
+                      const SizedBox(height: 16),
+                      Text(
+                        'Extracted Details',
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      _buildOcrSummaryCard(theme),
                     ],
                   ],
                 ),
