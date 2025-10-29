@@ -7,6 +7,7 @@ import 'package:Dharma/providers/case_provider.dart';
 import 'package:Dharma/providers/complaint_provider.dart';
 import 'package:Dharma/providers/petition_provider.dart';
 import 'package:Dharma/router/app_router.dart';
+import 'package:Dharma/services/firestore_service.dart';
 import 'firebase_options.dart';
 
 void main() async {
@@ -16,6 +17,9 @@ void main() async {
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+  
+  // Configure Firestore for better connection handling
+  FirestoreService.configureFirestore();
   
   runApp(const MyApp());
 }

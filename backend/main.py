@@ -9,6 +9,10 @@ from tempfile import NamedTemporaryFile
 from typing import List
 from dotenv import load_dotenv
 import dotenv
+import traceback
+import time
+import asyncio
+import dotenv
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
@@ -26,6 +30,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/health")
+async def health_check():
+    return {"status": "ok"}
 
 def extract_and_classify_case(image_path):
     with open(image_path, "rb") as img:
@@ -107,8 +116,9 @@ def _guess_mime_type_from_filename(filename: str) -> str:
         return "image/webp"
     return "application/octet-stream"
 
-def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str) -> dict:
+async def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str) -> dict:
     if not API_KEY:
+        print("[OCR ERROR] Missing GEMINI_API_KEY in environment", flush=True)
         return {"error": "GEMINI_API_KEY is not set on the server"}
 
     encoded = base64.b64encode(image_bytes).decode("utf-8")
@@ -122,11 +132,24 @@ def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str) -> dict:
     )
 
     try:
-        response = model.generate_content([
-            {"inline_data": {"mime_type": mime_type, "data": encoded}},
-            prompt_json,
-        ])
+        start_ts = time.time()
+        print(f"[OCR GEMINI] JSON attempt (mime={mime_type}, bytes={len(image_bytes)})", flush=True)
+        # Add timeout to Gemini call
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                model.generate_content,
+                [
+                    {"inline_data": {"mime_type": mime_type, "data": encoded}},
+                    prompt_json,
+                ]
+            ),
+            timeout=30.0  # 30 second timeout
+        )
+        print(f"[OCR GEMINI] JSON attempt completed in {time.time() - start_ts:.2f}s", flush=True)
     except Exception as e:
+        print("[OCR ERROR] Gemini call failed on JSON attempt", flush=True)
+        print(type(e).__name__, str(e), flush=True)
+        print(traceback.format_exc(), flush=True)
         return {"error": f"Gemini call failed: {e}"}
 
     raw = (getattr(response, "text", None) or "").strip()
@@ -143,28 +166,42 @@ def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str) -> dict:
 
     # Fallback 1: Ask for plain text only
     try:
-        retry_resp = model.generate_content([
-            {"inline_data": {"mime_type": mime_type, "data": encoded}},
-            "Extract all readable text only. Respond with plain text and nothing else.",
-        ])
+        print("[OCR GEMINI] Plain-text fallback attempt", flush=True)
+        retry_resp = await asyncio.wait_for(
+            asyncio.to_thread(
+                model.generate_content,
+                [
+                    {"inline_data": {"mime_type": mime_type, "data": encoded}},
+                    "Extract all readable text only. Respond with plain text and nothing else.",
+                ]
+            ),
+            timeout=30.0  # 30 second timeout
+        )
         retry_text = (getattr(retry_resp, "text", None) or "").strip()
         if retry_text:
             return {"text": retry_text}
-    except Exception:
-        pass
+    except Exception as e:
+        print("[OCR ERROR] Plain-text fallback failed", flush=True)
+        print(type(e).__name__, str(e), flush=True)
+        print(traceback.format_exc(), flush=True)
 
     # Fallback 2: collect any text parts from candidates
     try:
+        print("[OCR GEMINI] Candidate parts fallback attempt", flush=True)
         for cand in getattr(response, "candidates", []) or []:
             for part in getattr(getattr(cand, "content", None), "parts", []) or []:
                 if isinstance(part, dict) and "text" in part and str(part.get("text")).strip():
                     return {"text": str(part.get("text")).strip()}
                 if isinstance(part, str) and part.strip():
                     return {"text": part.strip()}
-    except Exception:
-        pass
+    except Exception as e:
+        print("[OCR ERROR] Candidate parsing failed", flush=True)
+        print(type(e).__name__, str(e), flush=True)
+        print(traceback.format_exc(), flush=True)
 
     # Final fallback
+    if not raw:
+        print("[OCR WARNING] Empty response text from Gemini", flush=True)
     return {"text": raw}
 
 
@@ -190,9 +227,11 @@ async def ocr_extract(file: UploadFile = File(...)):
 
     # Extract
     try:
-        result = extract_text_from_image_bytes(data, content_type)
+        result = await extract_text_from_image_bytes(data, content_type)
     except Exception as e:
-        print(f"[OCR ERROR] exception={e}", flush=True)
+        print("[OCR ERROR] Unhandled exception in ocr_extract", flush=True)
+        print(type(e).__name__, str(e), flush=True)
+        print(traceback.format_exc(), flush=True)
         return {"error": f"OCR processing failed: {e}"}
 
     # Log the extracted text (truncate to avoid huge logs)
@@ -208,6 +247,9 @@ async def ocr_extract(file: UploadFile = File(...)):
     except Exception as e:
         print(f"[OCR LOGGING ERROR] {e}", flush=True)
 
-    if isinstance(result, dict) and "text" in result and not result.get("error"):
-        return {"text": result.get("text", "")}
-    return {"text": result.get("text", "") if isinstance(result, dict) else ""}
+    if isinstance(result, dict):
+        if result.get("error"):
+            return {"error": result.get("error")}
+        if "text" in result:
+            return {"text": result.get("text", "")}
+    return {"error": "Unexpected OCR result format"}

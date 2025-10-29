@@ -9,6 +9,7 @@ import 'package:Dharma/models/petition.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 // import 'package:go_router/go_router.dart';
 import 'package:Dharma/services/local_storage_service.dart';
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 
 class PetitionsScreen extends StatefulWidget {
   const PetitionsScreen({super.key});
@@ -74,6 +75,7 @@ class _PetitionsScreenState extends State<PetitionsScreen> with SingleTickerProv
       appBar: AppBar(
         title: const Text('Petition Management'),
         bottom: TabBar(
+          isScrollable: true,
           controller: _tabController,
           tabs: const [
             Tab(icon: Icon(Icons.list), text: 'My Petitions'),
@@ -353,6 +355,48 @@ class _PetitionsScreenState extends State<PetitionsScreen> with SingleTickerProv
                   const SizedBox(height: 8),
                   Text(petition.orderDetails!),
                 ],
+                if (petition.extractedText != null && petition.extractedText!.isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  Text(
+                    'Extracted Text from Documents',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.grey[100],
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.grey[300]!),
+                    ),
+                    child: Text(
+                      petition.extractedText!,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        height: 1.4,
+                      ),
+                    ),
+                  ),
+                ] else ...[
+                  const SizedBox(height: 16),
+                  Text(
+                    'Extracted Text from Documents',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'No Documents Uploaded...',
+                    style: TextStyle(
+                      color: Colors.grey[600],
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ],
               ],
             ),
           );
@@ -384,12 +428,18 @@ class _PetitionsScreenState extends State<PetitionsScreen> with SingleTickerProv
   }
 
   Widget _buildCreatePetitionTab(ThemeData theme) {
-    return const CreatePetitionForm();
+    return CreatePetitionForm(
+      onCreatedSuccess: () {
+        _tabController.index = 0;
+      },
+    );
   }
 }
 
 class CreatePetitionForm extends StatefulWidget {
-  const CreatePetitionForm({super.key});
+  const CreatePetitionForm({super.key, this.onCreatedSuccess});
+
+  final VoidCallback? onCreatedSuccess;
 
   @override
   State<CreatePetitionForm> createState() => _CreatePetitionFormState();
@@ -416,6 +466,40 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
   Map<String, dynamic>? _ocrResult;
   final Dio _dio = Dio();
   String _ocrEndpoint = 'http://localhost:8000/api/ocr/extract';
+
+  @override
+  void initState() {
+    super.initState();
+    // Resolve backend base URL per platform (Android emulator uses 10.0.2.2 for host loopback)
+    final bool isAndroid = !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+    String baseUrl;
+    if (kIsWeb) {
+      final Uri u = Uri.base; // current page URL
+      final String scheme = u.scheme.isNotEmpty ? u.scheme : 'http';
+      final String host = (u.host.isNotEmpty ? u.host : 'localhost');
+      baseUrl = '$scheme://$host:8000';
+    } else if (isAndroid) {
+      baseUrl = 'http://10.0.2.2:8000';
+    } else {
+      baseUrl = 'http://localhost:8000';
+    }
+    _ocrEndpoint = '$baseUrl/api/ocr/extract';
+  }
+
+  Future<void> _checkBackendHealth(String baseUrl) async {
+    try {
+      await _dio.get(
+        '$baseUrl/api/health',
+        options: Options(
+          receiveTimeout: const Duration(seconds: 5),
+          sendTimeout: const Duration(seconds: 5),
+          validateStatus: (code) => true,
+        ),
+      );
+    } catch (e) {
+      rethrow;
+    }
+  }
 
   @override
   void dispose() {
@@ -465,6 +549,22 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final petitionProvider = Provider.of<PetitionProvider>(context, listen: false);
 
+    // Ensure OCR has been attempted if files are present but no result captured yet
+    try {
+      if (_ocrResult == null && _pickedFiles.isNotEmpty) {
+        await _runOcrOnFile(_pickedFiles.first);
+      }
+    } catch (_) {
+      // Safe to ignore here; we still proceed with petition creation
+    }
+
+    // Normalize extracted text (empty string -> null)
+    final String? extractedText = (() {
+      final String? t = (_ocrResult?['text'] as String?)?.trim();
+      if (t == null || t.isEmpty) return null;
+      return t;
+    })();
+
     final petition = Petition(
       title: _titleController.text,
       type: _selectedType,
@@ -483,6 +583,7 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
       prayerRelief: _prayerReliefController.text.isEmpty 
           ? null 
           : _prayerReliefController.text,
+      extractedText: extractedText,
       userId: authProvider.user!.uid,
       createdAt: Timestamp.now(),
       updatedAt: Timestamp.now(),
@@ -528,8 +629,13 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
         _prayerReliefController.clear();
         setState(() {
           _pickedFiles = [];
+          _ocrResult = null;
         });
         await petitionProvider.fetchPetitions(authProvider.user!.uid);
+        // Notify parent screen to navigate to "My Petitions" tab
+        if (mounted) {
+          widget.onCreatedSuccess?.call();
+        }
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -565,6 +671,10 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
         throw Exception('File content unavailable');
       }
 
+      // Quick health check to avoid long timeouts with misconfigured URL
+      final String baseUrl = _ocrEndpoint.replaceFirst('/api/ocr/extract', '');
+      await _checkBackendHealth(baseUrl);
+
       final formData = FormData.fromMap({ 'file': mFile });
       final response = await _dio.post(
         _ocrEndpoint,
@@ -573,14 +683,24 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
           contentType: 'multipart/form-data',
           receiveTimeout: const Duration(seconds: 60),
           sendTimeout: const Duration(seconds: 60),
+          followRedirects: false,
+          validateStatus: (code) => code != null && code >= 200 && code < 400,
         ),
       );
 
-      setState(() { _ocrResult = Map<String, dynamic>.from(response.data); });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Text generated successfully.')),
-      );
+      final Map<String, dynamic> data = Map<String, dynamic>.from(response.data);
+      final String extracted = (data['text'] as String?)?.trim() ?? '';
+      if (extracted.isNotEmpty) {
+        setState(() { _ocrResult = {'text': extracted}; });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Text extraction successful')),
+        );
+      } else {
+        setState(() { _ocrResult = null; });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No text detected in the selected file.')),
+        );
+      }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('OCR failed: $e')),
@@ -636,6 +756,7 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                         labelText: 'Petition Type *',
                         border: OutlineInputBorder(),
                       ),
+                      isExpanded: true,
                       items: PetitionType.values.map((type) {
                         return DropdownMenuItem(
                           value: type,
@@ -653,6 +774,7 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                         labelText: 'Status *',
                         border: OutlineInputBorder(),
                       ),
+                      isExpanded: true,
                       items: PetitionStatus.values.map((status) {
                         return DropdownMenuItem(
                           value: status,
@@ -671,6 +793,7 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                           labelText: 'Link to Case (Optional)',
                           border: OutlineInputBorder(),
                         ),
+                        isExpanded: true,
                         items: [
                           const DropdownMenuItem(
                             value: null,
@@ -804,7 +927,7 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                     ),
                     const SizedBox(height: 16),
                     Text(
-                      'Supporting Documents (stored locally only)',
+                      'Supporting Documents (Optional, stored locally only)',
                       style: theme.textTheme.titleMedium?.copyWith(
                         fontWeight: FontWeight.bold,
                       ),
@@ -824,6 +947,7 @@ class _CreatePetitionFormState extends State<CreatePetitionForm> {
                                   final FilePickerResult? result = await FilePicker.platform.pickFiles(
                                     allowMultiple: true,
                                     withData: true,
+                                    type: FileType.image,
                                   );
                                   if (result != null && result.files.isNotEmpty) {
                                     setState(() {
